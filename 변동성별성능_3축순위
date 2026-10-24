@@ -414,3 +414,539 @@
   }
  ]
 }
+
+
+
+
+
+
+################################################################################################################################################
+
+
+
+
+
+
+!pip -q install openpyxl
+
+from pathlib import Path
+import shutil
+import pandas as pd
+from IPython.display import display
+from google.colab import files
+
+# 1. 기존 결과 엑셀 업로드
+uploaded = files.upload()
+paths = [Path(name) for name in uploaded if name.lower().endswith(".xlsx")]
+if len(paths) != 1:
+    raise ValueError("결과 엑셀(.xlsx)을 정확히 1개 업로드해 주세요.")
+path = paths[0]
+
+# 제목·설명 행이 있더라도 실제 헤더를 찾아 읽습니다.
+def read_table(sheet, required):
+    raw = pd.read_excel(path, sheet_name=sheet, header=None)
+    for i, row in raw.iterrows():
+        values = set(row.dropna().astype(str).str.strip())
+        if set(required).issubset(values):
+            table = pd.read_excel(path, sheet_name=sheet, header=i)
+            table.columns = table.columns.astype(str).str.strip()
+            return table.dropna(subset=required, how="all")
+    raise ValueError(f"{sheet}: 필요한 열 {required}을 찾지 못했습니다.")
+
+keys = ["대상", "종류", "업종"]
+group_keys = ["대상", "종류"]
+
+rank = read_table(
+    "실제예측3축순위",
+    keys + ["실제3축순위", "분석범위검토"]
+)
+epi = read_table(
+    "에피소드3축",
+    keys + ["에피소드", "실제판정"]
+)
+
+for df in [rank, epi]:
+    for col in keys:
+        if df[col].isna().any():
+            raise ValueError(f"{col}에 결측값이 있습니다.")
+        df[col] = df[col].astype(str).str.strip()
+
+if rank.duplicated(keys).any():
+    raise ValueError("업종별 시즌 순위에 중복 행이 있습니다.")
+if epi["에피소드"].isna().any():
+    raise ValueError("사건 번호에 결측값이 있습니다.")
+if epi.duplicated(keys + ["에피소드"]).any():
+    raise ValueError("같은 업종·사건에 중복 행이 있습니다.")
+
+# 기존 판정을 사용합니다. 감소 기준을 새로 계산하지 않습니다.
+epi["실제판정"] = epi["실제판정"].astype("string").str.strip()
+
+counts = epi.groupby(keys, as_index=False).agg(
+    전체사건수=("에피소드", "nunique"),
+    감소사건수=("실제판정", lambda s: int(s.eq("감소").sum())),
+    계산불가사건수=(
+        "실제판정",
+        lambda s: int(s.fillna("").str.replace(" ", "").eq("계산불가").sum())
+    ),
+    판정결측사건수=("실제판정", lambda s: int(s.isna().sum()))
+)
+
+# 업종별로 해당 지역·기상의 전체 사건이 모두 기록됐는지 확인합니다.
+expected = (
+    epi.groupby(group_keys)["에피소드"]
+    .nunique().rename("지역기상전체사건수").reset_index()
+)
+counts = counts.merge(expected, on=group_keys, validate="many_to_one")
+
+if counts["전체사건수"].ne(counts["지역기상전체사건수"]).any():
+    raise ValueError(
+        "일부 업종의 사건 행이 누락돼 있습니다. "
+        "분모가 달라질 수 있으므로 원자료를 확인해 주세요."
+    )
+
+rank["실제3축순위"] = pd.to_numeric(
+    rank["실제3축순위"], errors="raise"
+)
+
+# 공동순위를 포함해 기존 실제 10위 이내만 사용
+base = rank.loc[rank["실제3축순위"].le(10)].copy()
+base = base.merge(counts, on=keys, how="left", validate="one_to_one")
+
+if base["전체사건수"].isna().any():
+    raise ValueError("실제 상위 업종 중 사건별 결과가 없는 업종이 있습니다.")
+
+# 보류 열의 값을 명시적으로 해석하고, 모르는 값은 중단합니다.
+def parse_bool(series):
+    normalized = series.astype("string").str.strip().str.lower()
+    mapping = {
+        "true": True, "1": True, "1.0": True,
+        "false": False, "0": False, "0.0": False
+    }
+    parsed = normalized.map(mapping)
+    if parsed.isna().any():
+        unknown = series.loc[parsed.isna()].unique()
+        raise ValueError(f"분석범위검토 값 확인 필요: {unknown}")
+    return parsed.astype(bool)
+
+base["범위검토보류"] = parse_bool(base["분석범위검토"])
+base["감소사건비율"] = base["감소사건수"] / base["전체사건수"]
+base["감소횟수"] = (
+    base["감소사건수"].astype(int).astype(str)
+    + "/"
+    + base["전체사건수"].astype(int).astype(str)
+)
+
+# 2. 변경하는 부분: 반복 감소 비율만 세 조건으로 비교
+# 정수 비교를 사용해 경계값을 정확하게 처리합니다.
+eligible = base["감소사건수"].ge(2) & ~base["범위검토보류"]
+
+conditions = {
+    "50% 이상": base["감소사건수"] * 2 >= base["전체사건수"],
+    "50% 초과": base["감소사건수"] * 2 > base["전체사건수"],
+    "75% 이상": base["감소사건수"] * 4 >= base["전체사건수"] * 3
+}
+
+for label, mask in conditions.items():
+    base[label] = eligible & mask
+
+base = base.sort_values(group_keys + ["실제3축순위", "업종"])
+labels = list(conditions)
+
+# 3. 조건별 후보 수: 후보가 0개인 조합도 유지
+count_table = (
+    base.groupby(group_keys, sort=False)[labels]
+    .sum().astype(int)
+)
+count_output = count_table.reset_index()
+total = pd.DataFrame([{
+    "대상": "합계",
+    "종류": "지역·기상·업종 조합",
+    **count_table.sum().to_dict()
+}])
+count_output = pd.concat([count_output, total], ignore_index=True)
+
+print("\n[조건별 후보 수]")
+display(count_output)
+
+# 4. 조건별 후보 목록
+summary_rows = []
+candidate_frames = []
+
+for (region, weather), g in base.groupby(group_keys, sort=False):
+    for label in labels:
+        selected = g.loc[g[label]].copy()
+        summary_rows.append({
+            "대상": region,
+            "종류": weather,
+            "비율조건": label,
+            "후보수": len(selected),
+            "후보업종": ", ".join(
+                selected["업종"] + "(" + selected["감소횟수"] + ")"
+            ) or "없음"
+        })
+        selected["비율조건"] = label
+        candidate_frames.append(selected)
+
+summary = pd.DataFrame(summary_rows)
+candidates = pd.concat(candidate_frames, ignore_index=True)
+
+print("\n[조건별 후보 목록]")
+display(summary)
+
+# 5. 모든 조건에서 유지 / 조건 강화 시 제외
+change_rows = []
+
+def format_names(g):
+    return ", ".join(g["업종"] + "(" + g["감소횟수"] + ")") or "없음"
+
+for (region, weather), g in base.groupby(group_keys, sort=False):
+    change_rows.append({
+        "대상": region,
+        "종류": weather,
+        "모든 조건에서 유지": format_names(
+            g.loc[g[labels].all(axis=1)]
+        ),
+        "50% 초과부터 제외": format_names(
+            g.loc[g["50% 이상"] & ~g["50% 초과"]]
+        ),
+        "75% 이상에서 제외": format_names(
+            g.loc[g["50% 초과"] & ~g["75% 이상"]]
+        )
+    })
+
+changes = pd.DataFrame(change_rows)
+print("\n[조건 강화에 따른 변화]")
+display(changes)
+
+detail_cols = keys + [
+    "실제3축순위", "감소횟수", "감소사건비율",
+    "계산불가사건수", "판정결측사건수", "범위검토보류"
+] + labels
+
+print("\n[실제 10위 이내 업종 전체 비교]")
+display(base[detail_cols])
+
+print("""
+※ 기존 감소 판정·3축 계산·순위 산정 기준은 변경하지 않았습니다.
+※ 최소 2회 감소 및 분석범위검토 업종 보류 조건을 유지했습니다.
+※ 계산 불가 사건도 전체 사건 수에 포함하며, 감소 횟수에는 넣지 않습니다.
+※ 합계는 지역·기상·업종 조합 수이며, 고유 업종 수가 아닙니다.
+※ 이 분석은 추가 반복성 조건의 민감도 비교입니다.
+※ 조건에서 제외돼도 기존 감소 판정이나 취약 순위는 그대로입니다.
+""")
+
+# 6. 결과 저장 및 ZIP 다운로드
+out = Path("반복감소비율_민감도분석")
+out.mkdir(exist_ok=True)
+
+tables = {
+    "조건별_후보수.csv": count_output,
+    "조건별_후보목록.csv": summary,
+    "조건강화_목록변화.csv": changes,
+    "실제상위10위이내_전체비교.csv": base[detail_cols],
+    "조건별_후보상세.csv": candidates[
+        ["비율조건"] + detail_cols
+    ]
+}
+
+for filename, table in tables.items():
+    table.to_csv(out / filename, index=False, encoding="utf-8-sig")
+
+archive = shutil.make_archive(str(out), "zip", root_dir=out)
+files.download(archive)
+
+
+
+
+######################################################################################################
+
+
+!pip -q install openpyxl scipy
+
+from pathlib import Path
+import shutil
+import numpy as np
+import pandas as pd
+from IPython.display import display
+from google.colab import files
+
+# 1. 기존 결과 업로드
+uploaded = files.upload()
+paths = [Path(name) for name in uploaded if name.lower().endswith(".xlsx")]
+if len(paths) != 1:
+    raise ValueError("결과 엑셀(.xlsx)을 정확히 1개 업로드해 주세요.")
+path = paths[0]
+
+required = [
+    "대상", "종류", "업종", "gkey",
+    "실제판정", "실제Impact", "실제Cumulative",
+    "실제Recovery", "실제미확인수",
+    "실제3축점수", "실제3축순위"
+]
+
+def read_table(sheet, required):
+    raw = pd.read_excel(path, sheet_name=sheet, header=None)
+    for i, row in raw.iterrows():
+        if set(required).issubset(
+            set(row.dropna().astype(str).str.strip())
+        ):
+            df = pd.read_excel(path, sheet_name=sheet, header=i)
+            df.columns = df.columns.astype(str).str.strip()
+            return df.dropna(subset=["대상", "종류", "업종"], how="all")
+    raise ValueError(f"{sheet}: 필요한 열을 찾지 못했습니다.")
+
+df = read_table("실제예측3축순위", required)
+
+for col in [
+    "실제Impact", "실제Cumulative", "실제Recovery",
+    "실제미확인수", "실제3축점수", "실제3축순위"
+]:
+    df[col] = pd.to_numeric(df[col], errors="raise")
+
+if df[["대상", "종류", "업종", "gkey"]].isna().any().any():
+    raise ValueError("지역·기상·업종·gkey에 결측값이 있습니다.")
+if df.duplicated(["대상", "종류", "gkey"]).any():
+    raise ValueError("동일 지역·기상·gkey에 중복 행이 있습니다.")
+if df["실제미확인수"].isna().any():
+    raise ValueError("실제미확인수에 결측값이 있습니다.")
+
+# 비교 가중치
+weights = {
+    "기존: 동일가중치": (1/3, 1/3, 1/3),
+    "Impact 중심": (0.50, 0.25, 0.25),
+    "누적감소 중심": (0.25, 0.50, 0.25),
+    "회복 중심": (0.25, 0.25, 0.50),
+    "회복 제외": (0.50, 0.50, 0.00),
+}
+baseline = "기존: 동일가중치"
+
+display(pd.DataFrame.from_dict(
+    weights, orient="index",
+    columns=["Impact", "Cumulative", "Recovery"]
+).rename_axis("조건"))
+
+# 2. 기존 실제 3축 계산 대상 재현
+# 회복 제외 조건에서도 후보 집합은 기존 3축 대상에 고정합니다.
+mask = (
+    df["실제판정"].eq("감소")
+    & df["실제Impact"].notna()
+    & df["실제Cumulative"].notna()
+    & (df["실제Recovery"].notna() | df["실제미확인수"].gt(0))
+)
+
+if not np.array_equal(mask.to_numpy(),
+                      df["실제3축순위"].notna().to_numpy()):
+    raise ValueError(
+        "재구성한 실제 3축 대상과 기존 순위 대상이 다릅니다. "
+        "기존 결과 파일을 확인해 주세요."
+    )
+
+candidate = df.loc[mask].copy()
+if candidate.empty:
+    raise ValueError("실제 3축 순위 대상이 없습니다.")
+
+checks, results, comparisons, movements = [], [], [], []
+
+def ordered(g, score_col):
+    # 점수 내림차순, 동점이면 원래 gkey 오름차순
+    return g.sort_values(
+        [score_col, "gkey"],
+        ascending=[False, True],
+        kind="mergesort"
+    )
+
+for (region, weather), source in candidate.groupby(
+    ["대상", "종류"], sort=True
+):
+    g = source.copy()
+
+    # 기존 코드와 같은 축별 백분위
+    g["Impact백분위"] = g["실제Impact"].rank(
+        ascending=False, pct=True, method="average"
+    )
+    g["Cumulative백분위"] = g["실제Cumulative"].rank(
+        ascending=False, pct=True, method="average"
+    )
+
+    recovery = g["실제Recovery"].copy()
+    # 값 자체를 회복일로 대치하지 않고 순위 계산에서만 최대 범주 처리
+    recovery.loc[g["실제미확인수"].gt(0)] = np.inf
+    g["Recovery백분위"] = recovery.rank(
+        ascending=True, pct=True, method="average"
+    )
+
+    pct_cols = [
+        "Impact백분위", "Cumulative백분위", "Recovery백분위"
+    ]
+
+    # 기존 동일가중치 계산을 그대로 재현
+    equal_score = g[pct_cols].mean(
+        axis=1, skipna=False
+    ).round(12)
+    equal_rank = equal_score.rank(
+        ascending=False, method="min"
+    )
+
+    max_error = (equal_score - g["실제3축점수"]).abs().max()
+    score_ok = np.allclose(
+        equal_score, g["실제3축점수"], rtol=0, atol=1e-12
+    )
+    rank_ok = np.array_equal(
+        equal_rank.to_numpy(), g["실제3축순위"].to_numpy()
+    )
+
+    checks.append({
+        "대상": region, "종류": weather,
+        "후보수": len(g),
+        "점수최대절대차": max_error,
+        "점수일치": score_ok, "순위일치": rank_ok
+    })
+
+    if not (score_ok and rank_ok):
+        display(pd.DataFrame(checks))
+        raise ValueError(
+            f"{region}·{weather}: 기존 점수 또는 순위가 재현되지 않아 중단합니다."
+        )
+
+    # 축 백분위를 고정하고 가중치만 변경
+    for condition, w in weights.items():
+        score_col = condition + "_점수"
+        rank_col = condition + "_순위"
+
+        if condition == baseline:
+            g[score_col] = equal_score
+        else:
+            g[score_col] = (
+                g["Impact백분위"] * w[0]
+                + g["Cumulative백분위"] * w[1]
+                + g["Recovery백분위"] * w[2]
+            ).round(12)
+
+        # 상관 계산용 순위: 기존처럼 공동순위 min
+        g[rank_col] = g[score_col].rank(
+            ascending=False, method="min"
+        )
+
+        # 상위 10개 선정용 순서: 동점은 gkey로 구분
+        order = ordered(g, score_col).index
+        g[condition + "_선택순서"] = (
+            pd.Series(range(1, len(g) + 1), index=order)
+            .reindex(g.index)
+        )
+
+    k = min(10, len(g))
+    old_order = ordered(g, baseline + "_점수").head(k)
+    old_keys = set(old_order["gkey"])
+
+    for condition in weights:
+        new_order = ordered(g, condition + "_점수").head(k)
+        new_keys = set(new_order["gkey"])
+
+        detail = g[[
+            "대상", "종류", "업종", "gkey",
+            "실제3축점수", "실제3축순위",
+            *pct_cols
+        ]].copy()
+        detail["조건"] = condition
+        detail["변경점수"] = g[condition + "_점수"]
+        detail["변경순위"] = g[condition + "_순위"]
+        detail["선택순서"] = g[condition + "_선택순서"]
+        detail["상위10포함"] = detail["선택순서"].le(k)
+        detail["순위변화_양수는상승"] = (
+            detail["실제3축순위"] - detail["변경순위"]
+        )
+        results.append(detail)
+
+        if condition == baseline:
+            continue
+
+        comparisons.append({
+            "대상": region,
+            "종류": weather,
+            "조건": condition,
+            "후보수": len(g),
+            "기존순위와_Spearman": g[baseline + "_순위"].corr(
+                g[condition + "_순위"], method="spearman"
+            ),
+            "상위k": k,
+            "상위겹침": len(old_keys & new_keys)
+        })
+
+        excluded = old_order.loc[
+            ~old_order["gkey"].isin(new_keys), "업종"
+        ]
+        included = new_order.loc[
+            ~new_order["gkey"].isin(old_keys), "업종"
+        ]
+        movements.append({
+            "대상": region,
+            "종류": weather,
+            "조건": condition,
+            "상위10에서제외": "·".join(excluded) or "없음",
+            "상위10에새로포함": "·".join(included) or "없음"
+        })
+
+checks = pd.DataFrame(checks)
+comparison = pd.DataFrame(comparisons)
+movement = pd.DataFrame(movements)
+detail = pd.concat(results, ignore_index=True)
+
+print("\n[동일가중치 재현 확인]")
+display(checks)
+
+print("\n[기존 실제 순위와 변경 후 실제 순위 비교]")
+comparison["표시"] = comparison.apply(
+    lambda r: f"{r['기존순위와_Spearman']:.3f} / {int(r['상위겹침'])}개",
+    axis=1
+)
+display(
+    comparison.pivot(
+        index=["대상", "종류"], columns="조건", values="표시"
+    ).reindex(columns=list(weights)[1:])
+)
+
+print("\n[조건별 상위 10개 진입·이탈]")
+display(movement)
+
+print("\n[강남 폭염: 회복 제외 시 변화]")
+display(movement.loc[
+    movement["대상"].astype(str).str.contains("강남")
+    & movement["종류"].eq("폭염")
+    & movement["조건"].eq("회복 제외")
+])
+
+print("""
+※ 실제 감소 후보 집합과 축별 백분위는 고정했습니다.
+※ 분석범위검토 업종을 추가로 제외하거나 반복 감소 조건을 적용하지 않습니다.
+※ 미확인은 순위 계산에서 모든 확인 회복값보다 취약하게 공동 처리합니다.
+※ 점수는 소수 12자리 반올림, 공동순위는 min 방식입니다.
+※ 상위 목록은 정확히 10개를 선택하고, 경계 동점은 gkey 순서로 구분합니다.
+   후보가 10개 미만이면 전체 후보를 사용합니다.
+※ Spearman은 기존 실제 순위와 변경 후 실제 순위의 상관입니다.
+   모델의 실제·예측 순위상관이 아닙니다.
+""")
+
+# 3. 결과 다운로드
+out = Path("3축가중치_민감도분석")
+out.mkdir(exist_ok=True)
+
+tables = {
+    "동일가중치_재현검증.csv": checks,
+    "기존순위와_민감도비교.csv": comparison,
+    "상위10_진입이탈.csv": movement,
+    "조건별_전체순위.csv": detail,
+    "조건별_상위10.csv": detail.loc[detail["상위10포함"]],
+}
+
+for filename, table in tables.items():
+    table.to_csv(out / filename, index=False, encoding="utf-8-sig")
+
+archive = shutil.make_archive(str(out), "zip", root_dir=out)
+files.download(archive)
+
+
+
+
+
+
+

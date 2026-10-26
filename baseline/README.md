@@ -13,8 +13,7 @@ $$y_{slot}=\frac{S_{slot}-B_{slot}}{\sum_{slot} B_{slot}}\qquad(\text{분모} = 
 | `baseline_v4.ipynb` | **최종 baseline 재현 노트북 (Colab).** 이것만 실행하면 됩니다 |
 | `baseline_v4.py` | 같은 코드의 스크립트 버전 (Colab 밖에서 실행할 때) |
 | `requirements.txt` | 필요한 패키지 |
-| `docs/실험기록.md` | 23 → 37번 실험에서 무엇을 바꿨고 왜 그렇게 정했는지 |
-| `experiments/` | 결정 근거가 된 실험 노트북 (출력은 지움) |
+
 
 ## 실행 방법
 

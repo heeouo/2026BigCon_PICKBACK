@@ -31,15 +31,15 @@ $$y_{slot}=\frac{S_{slot}-B_{slot}}{\sum_{slot} B_{slot}}\qquad(\text{분모} = 
 **로컬**
 ```bash
 pip install -r requirements.txt
-python baseline_v4.py --data_dir ./data --out_dir ./outputs          # GPU 있으면 자동 사용
-python baseline_v4.py --data_dir ./data --out_dir ./outputs --cpu    # 숫자를 완전히 같게 재현하려면
+python baseline_v4.py --data_dir ./data --out_dir ./outputs          # GPU 있으면 자동 사용 (팀 결과 재현은 GPU)
+python baseline_v4.py --data_dir ./data --out_dir ./outputs --cpu    # CPU로 학습 (팀 결과와 B가 달라짐, 아래 참고)
 ```
 
 **출력**
 - `38_최종baseline_V4.csv`: 칸×날짜별 `S`(실제), `B`(baseline), `B_하루합`, `y`, `휴무`, `평시`, `특수일`, `폭염등급`, `호우등급`, 기상 열
 - `38_최종baseline_V4_검증요약.csv`: 평시 날 검증 지표
 
-CPU에서는 몇 번을 돌려도 결과가 똑같이 나옵니다. GPU는 소수점 아래가 아주 조금 다를 수 있습니다.
+**재현 환경 주의**: 팀 결과(취약 후보 43개)의 B는 **Colab T4 GPU + xgboost 3.4.1**로 만들었습니다. 같은 GPU 조건에서는 몇 번을 돌려도 B가 칸 하나까지 똑같습니다. CPU로 학습하면 subsample(0.8)의 행 추출 방식이 달라 B가 칸 단위로 −9%~+10% 달라지고, 취약 후보도 47개가 나옵니다(43개 중 42개 유지). 확인 노트북: [`reproduce/baseline_GPU_CPU비교.ipynb`](../reproduce/baseline_GPU_CPU비교.ipynb). 전체 파이프라인은 [`reproduce/`](../reproduce/README.md)를 보세요.
 
 ## 최종 모델 (V4)
 
